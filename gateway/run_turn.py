@@ -3589,16 +3589,28 @@ class GatewayTurnMixin:
         return self._run_agent_timeout_result(worker, turn_ctx)
 
     def _run_agent_evict_on_fallback(self, turn_ctx: TurnContext) -> None:
-        """Evict the cached agent when a fallback model activated on a SUCCESSFUL run (so /model shows
-        the active model and the next message retries the primary). Skip failed runs: evicting
-        would loop bad model → fallback → evict → recreate."""
+        """Evict unexplained route drift, but retain a native provider fallback.
+
+        Native restore_primary_runtime() already owns recovery at the next turn,
+        including the primary provider's cooldown and credential reset gate.
+        Evicting a successful fallback discards that in-memory cooldown and
+        recreates the primary on every message, even when its reset is hours away.
+        Explicit /model switches and session boundaries evict independently.
+        """
         session_key = turn_ctx.session_key
         _agent = turn_ctx.agent_holder[0]
         _result_for_fb = turn_ctx.result_holder[0]
         if _agent is None or not hasattr(_agent, 'model') or (_result_for_fb and _result_for_fb.get("failed")):
             return
-        # A provider fallback is drift even when it serves the configured model name on another endpoint.
+        # Keep the cached fallback and its primary runtime snapshot. Next turn's
+        # native restore gate returns to the selected model only when eligible.
         if getattr(_agent, "_provider_fallback_active", False) is True:
+            # Only preserve a complete native fallback snapshot. A stale
+            # marker without its original identity cannot be restored safely.
+            primary = getattr(_agent, "_primary_runtime", None) or {}
+            if (getattr(_agent, "_fallback_activated", False)
+                    and primary.get("model") and primary.get("provider")):
+                return
             self._evict_cached_agent(session_key)
             return
         _cfg_model = self._fallback_baseline_model(session_key, turn_ctx.source, _agent)

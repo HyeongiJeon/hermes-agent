@@ -4,6 +4,7 @@ Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``."""
 from __future__ import annotations
 
 import logging
+import math
 import asyncio
 import hashlib
 import os
@@ -138,6 +139,37 @@ def _status_model_route(
     # No raw ``model.context_length`` pin here: the resolver applies it only while the displayed
     # route still matches the configured one (a session /model switch must not inherit it).
     return model_name, provider_name, context_used, context_total, {"provider": provider_name, **route}
+
+
+def _provider_fallback_status_lines(agent) -> list[str]:
+    """Read-only selected/active model and primary retry condition for /status.
+
+    No auth, network or mutation: status inspection must not trigger a retry.
+    The primary snapshot exists only on a native provider fallback. A missing
+    agent after a gateway restart cannot establish active fallback status.
+    """
+    if not getattr(agent, "_provider_fallback_active", False):
+        return []
+    preferred = getattr(agent, "_primary_runtime", None) or {}
+    model, provider = _clean_str(preferred.get("model")), _clean_str(preferred.get("provider"))
+    active_model = _clean_str(getattr(agent, "model", None))
+    active_provider = _clean_str(getattr(agent, "provider", None))
+    if not all((model, provider, active_model, active_provider)):
+        return []
+    if (model, provider) == (active_model, active_provider):
+        return []
+    cooldown_until = getattr(agent, "_rate_limited_until", 0) or 0
+    try:
+        remaining = max(0, math.ceil(float(cooldown_until) - time.monotonic()))
+    except (TypeError, ValueError, OverflowError):
+        remaining = 0
+    retry = (f"eligible in approximately {remaining} s, on a later turn (not guaranteed)"
+             if remaining else "checked on a later turn, subject to provider and credential availability")
+    return [
+        f"**Selected model:** `{model}` ({provider})",
+        f"**Fallback active:** `{active_model}` ({active_provider})",
+        f"**Primary retry:** {retry}",
+    ]
 
 
 def _context_compressor_lines(agent, ctx, used: int) -> list[str]:
@@ -287,6 +319,7 @@ class GatewayStatusCommandsMixin:
             lines.append(t("gateway.status.model_provider", model=fields["model"], provider=fields["provider"]))
         elif fields["model"]:
             lines.append(t("gateway.status.model", model=fields["model"]))
+        lines.extend(_provider_fallback_status_lines(status_agent))
         try:
             from hermes_cli.anon_auth import free_tier_route
 

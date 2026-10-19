@@ -202,6 +202,27 @@ class TestFallbackEvictionHonorsChannelOverrides:
     def test_fallback_off_the_channel_model_still_evicts(self, monkeypatch):
         assert self._evicted_after_turn(monkeypatch, _make_source(), "fallback/model") is True
 
+    def test_native_provider_fallback_keeps_session_cooldown(self, monkeypatch):
+        """A successful fallback must not reset the primary 429 gate every turn."""
+        import time
+        assert self._evicted_after_turn(
+            monkeypatch, _make_source(), "fallback/model",
+            _provider_fallback_active=True,
+            _fallback_activated=True,
+            _rate_limited_until=time.monotonic() + 3600,
+            _primary_runtime={"model": "chan/model", "provider": "openrouter"},
+        ) is False
+
+    def test_native_fallback_is_retained_for_eligibility_probe_after_cooldown(self, monkeypatch):
+        """Let restore_primary_runtime decide: reset gates can outlive session cooldown."""
+        assert self._evicted_after_turn(
+            monkeypatch, _make_source(), "fallback/model",
+            _provider_fallback_active=True,
+            _fallback_activated=True,
+            _rate_limited_until=0,
+            _primary_runtime={"model": "chan/model", "provider": "openrouter"},
+        ) is False
+
     _WELCOME = "https://welcome-api.nousresearch.com/v1"
 
     @pytest.mark.parametrize("global_model", ["nous/welcome", "default/model"])

@@ -765,3 +765,30 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
+
+
+
+def test_status_reports_selected_route_and_fallback_without_changing_agent(monkeypatch):
+    from gateway.slash_commands_status import _provider_fallback_status_lines
+    snapshot = {"model": "gpt-6-sol", "provider": "openai-codex"}
+    agent = SimpleNamespace(model="muse-spark-1.3-contributor", provider="meta-ai",
+                            _provider_fallback_active=True, _primary_runtime=snapshot,
+                            _rate_limited_until=time.monotonic() + 120)
+    original = vars(agent).copy()
+    lines = _provider_fallback_status_lines(agent)
+    assert any("**Selected model:** `gpt-6-sol` (openai-codex)" in x for x in lines)
+    assert any("**Fallback active:** `muse-spark-1.3-contributor` (meta-ai)" in x for x in lines)
+    assert any("Primary retry:" in x and "not guaranteed" in x for x in lines)
+    assert vars(agent) == original
+    assert snapshot == {"model": "gpt-6-sol", "provider": "openai-codex"}
+
+
+def test_status_never_claims_a_fallback_from_missing_or_stale_identity():
+    from gateway.slash_commands_status import _provider_fallback_status_lines
+    assert _provider_fallback_status_lines(None) == []
+    agent = SimpleNamespace(model="gpt-6-sol", provider="openai-codex",
+                            _provider_fallback_active=False)
+    assert _provider_fallback_status_lines(agent) == []
+    agent._provider_fallback_active = True
+    agent._primary_runtime = {"model": "gpt-6-sol", "provider": "openai-codex"}
+    assert _provider_fallback_status_lines(agent) == []

@@ -2428,6 +2428,12 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._provider_fallback_route = None
     agent._fallback_index = 0
     agent._credential_pool_revert_id = None
+    # An explicit /model selection starts a new primary route. A rate-limit
+    # cooldown belongs to the PREVIOUS selected provider/model, not the new
+    # choice. Credential-pool 429 benches remain durable and are not cleared.
+    agent._rate_limited_until = 0
+    agent._rate_limit_backoff_count = 0
+    agent._restore_wait_logged = False
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
     # otherwise a failed turn silently re-activates the provider the user just rejected.
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
