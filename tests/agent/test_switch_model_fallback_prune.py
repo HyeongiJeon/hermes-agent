@@ -94,6 +94,19 @@ def test_manual_switch_clears_provider_fallback_provenance():
 
 
 
+def test_explicit_model_switch_clears_previous_primary_backoff_only():
+    import time
+    agent = _make_agent([{"provider": "nous", "model": "hermes-4"}])
+    agent._rate_limited_until = time.monotonic() + 3600
+    agent._rate_limit_backoff_count = 3
+    agent._restore_wait_logged = True
+    _switch_to_anthropic(agent)
+    assert agent._rate_limited_until == 0
+    assert agent._rate_limit_backoff_count == 0
+    assert agent._restore_wait_logged is False
+    assert agent._primary_runtime["model"] == "claude-sonnet-4-5"
+
+
 def test_switch_within_same_provider_preserves_chain():
     chain = [{"provider": "openrouter", "model": "x-ai/grok-4"}]
     agent = _make_agent(chain)
