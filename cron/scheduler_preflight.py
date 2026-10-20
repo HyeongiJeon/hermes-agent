@@ -201,14 +201,23 @@ class SharedRouteAdapters:
     See #101113.
     """
 
-    def __init__(self, primary_adapters, routes) -> None:
+    def __init__(self, primary_adapters, routes, *, own_adapters=None) -> None:
         self._primary = dict(primary_adapters or {})
         self._routes = list(routes or [])
+        self._own = dict(own_adapters or {})
 
     def __bool__(self) -> bool:
-        return bool(self._primary) and bool(self._routes)
+        return bool(self._own) or (bool(self._primary) and bool(self._routes))
+
+    def is_local(self, platform):
+        return self._own.get(platform) is not None
 
     def get(self, platform, target=None, default=None):
+        # Multiplex satellites may own e.g. A2A/Discord adapters while borrowing
+        # Slack from the PRIMARY. Local configured adapters must win unconditionally.
+        local = self._own.get(platform)
+        if local is not None:
+            return local
         if not target:
             return default
         adapter = self._primary.get(platform)
@@ -231,6 +240,20 @@ class SharedRouteAdapters:
             ):
                 return adapter
         return default
+
+
+def satellite_adapters_for_profile(own_adapters, primary_adapters):
+    """Combine native satellite adapters and precisely routed PRIMARY ingress.
+
+    A profile with its own A2A or Discord adapter still needs a shared Slack
+    adapter for routed cron delivery. Never expose un-routed primary targets.
+    """
+    own = own_adapters if own_adapters is not None else {}
+    if primary_adapters:
+        routes = _primary_profile_routes_for_current_home()
+        if routes:
+            return SharedRouteAdapters(primary_adapters, routes, own_adapters=own)
+    return own  # preserve the native map identity when there are no satellite routes
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:

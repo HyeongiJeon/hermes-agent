@@ -160,3 +160,77 @@ def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled()
         {"id": "j"}, Platform.DISCORD, "discord", {"platform": "discord", "chat_id": "C1"},
         {Platform.DISCORD: adapter}, config)
     assert resolved is None and "not configured/enabled" in err
+
+
+
+def test_satellite_with_own_other_adapter_can_deliver_slack_via_primary(tmp_path, monkeypatch):
+    """A real MyAllJobs satellite owns another adapter; lack of own Slack must not veto a
+    primary Slack route. Before #phase5 this yielded 'not configured/enabled'."""
+    from cron.scheduler_preflight import satellite_adapters_for_profile
+    root = tmp_path / "root"
+    sat = root / "profiles" / "travel"
+    sat.mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({
+        "gateway": {"multiplex_profiles": True, "profile_routes": [
+            {"name": "travel", "platform": "slack",
+             "chat_id": "C_TRAVEL", "profile": "travel"},
+            {"name": "game", "platform": "slack",
+             "chat_id": "C_GAME", "profile": "game"}
+        ]}}), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+    slack = _primary_adapter()
+    a2a = object()
+    token = set_hermes_home_override(str(sat))
+    try:
+        merged = satellite_adapters_for_profile(
+            {Platform.DISCORD: a2a}, {Platform.SLACK: slack})
+        assert isinstance(merged, SharedRouteAdapters)
+        assert merged.get(Platform.DISCORD) is a2a
+        assert merged.get(Platform.SLACK) is None  # never leak the default bot
+        assert merged.get(Platform.SLACK, {"chat_id": "C_TRAVEL"}) is slack
+        assert merged.get(Platform.SLACK, {"chat_id": "C_GAME"}) is None
+        config = MagicMock()
+        config.platforms = {Platform.DISCORD: PlatformConfig(enabled=True)}
+        config.get_home_channel = lambda p: None
+        from cron.scheduler_delivery import _resolve_target_transport
+        transport, err = _resolve_target_transport(
+            {"id":"t"}, Platform.SLACK, "slack", {"chat_id": "C_TRAVEL"},
+            merged, config)
+        assert err is None and transport[2] is slack
+        blocked, error = _resolve_target_transport(
+            {"id":"t"}, Platform.SLACK, "slack", {"chat_id": "C_GAME"},
+            merged, config)
+        assert blocked is None and "not configured/enabled" in error
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_satellite_native_discord_keeps_own_transport_when_primary_has_slack_route(
+    tmp_path, monkeypatch,
+):
+    from cron.scheduler_preflight import satellite_adapters_for_profile
+    root = tmp_path / "root"
+    sat = root / "profiles" / "ops"
+    sat.mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({
+        "gateway":{"profile_routes":[
+            {"name":"ops", "platform":"slack", "chat_id":"C_OPS", "profile":"ops"}
+        ]}}), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda:root)
+    own_discord=object()
+    slack=object()
+    token=set_hermes_home_override(str(sat))
+    try:
+        merged=satellite_adapters_for_profile(
+            {Platform.DISCORD:own_discord, Platform.TELEGRAM:object()}, {Platform.SLACK:slack})
+        assert merged.get(Platform.DISCORD) is own_discord
+        from cron.scheduler_delivery import _resolve_target_transport
+        config=MagicMock()
+        config.platforms={Platform.DISCORD:PlatformConfig(enabled=True)}
+        result,err=_resolve_target_transport(
+            {"id":"t"},Platform.DISCORD,"discord",{"chat_id":"OWN"},
+            merged,config)
+        assert err is None and result[2] is own_discord
+        assert merged.get(Platform.SLACK,{"chat_id":"C_OPS"}) is slack
+    finally:
+        reset_hermes_home_override(token)
