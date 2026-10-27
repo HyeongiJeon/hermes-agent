@@ -410,6 +410,9 @@ def _failed_scope_stop(registry, monkeypatch, stops) -> ProcessSession:
     session = _scoped_session(registry, monkeypatch, "proc_pending_scope", stops)
     session.started_at -= module.FINISHED_TTL_SECONDS + 1
     registry._finish_exited(session, 0)
+    # The retention TTL runs from the FINISH, not the start: age the finish so this session is
+    # expired-on-scope-stop like the record it stands in for.
+    session.exited_at -= module.FINISHED_TTL_SECONDS + 1
     assert "scope_stop_failed" in registry.kill_process(session.id)
     return session
 

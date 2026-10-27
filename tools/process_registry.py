@@ -2576,7 +2576,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         either way: it is kill_all's only handle on a scope that may hold live descendants."""
         now = time.time()
         prunable = {sid: s for sid, s in self._finished.items() if not getattr(s, "_scope_stop_pending", False)}
-        expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
+        expired = [
+            sid
+            for sid, s in prunable.items()
+            # Age from the FINISH time, not the start: a round that ran longer than the TTL is
+            # not expired the moment it exits — the completion watcher (5s poll) would never see
+            # it and the completion event would be lost. Sessions with no recorded ``exited_at``
+            # (direct/legacy inserts, defensive paths) keep the old start-based age.
+            if now - (getattr(s, "exited_at", 0.0) or s.started_at) > FINISHED_TTL_SECONDS
+        ]
         over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
         if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
             expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
