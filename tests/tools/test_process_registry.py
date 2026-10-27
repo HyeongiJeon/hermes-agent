@@ -736,6 +736,35 @@ class TestPruning:
         registry._prune_if_needed()
         assert "proc_old" not in registry._finished
 
+    def test_prune_ages_from_finish_not_start(self, registry):
+        """A round that just finished stays readable however long it ran.
+
+        Regression: expiry measured ``started_at``, so any process that ran longer than
+        FINISHED_TTL_SECONDS was pruned at the first prune after it exited — before the 5s
+        completion watcher could read it — and its completion event was lost.
+        """
+        now = time.time()
+        session = _make_session(sid="proc_long_round", exited=True)
+        session.started_at = now - (FINISHED_TTL_SECONDS * 2)  # ran 60 minutes
+        session.exited_at = now  # finished just now
+        registry._finished[session.id] = session
+
+        registry._prune_if_needed()
+
+        assert session.id in registry._finished
+
+    def test_prune_expired_after_finish_ttl(self, registry):
+        """The retention window runs from the finish, whatever the runtime was."""
+        now = time.time()
+        session = _make_session(sid="proc_short_round", exited=True)
+        session.started_at = now - (FINISHED_TTL_SECONDS + 60) - 120  # ran 2 minutes
+        session.exited_at = now - (FINISHED_TTL_SECONDS + 60)  # finished 31 minutes ago
+        registry._finished[session.id] = session
+
+        registry._prune_if_needed()
+
+        assert session.id not in registry._finished
+
     def test_prune_over_max_removes_oldest(self, registry):
         # Fill up to MAX_PROCESSES
         for i in range(MAX_PROCESSES):
