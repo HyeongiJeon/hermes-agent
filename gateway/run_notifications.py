@@ -130,6 +130,25 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
     _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
     _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[1:])
 
+    def _completion_diag(self, evt: dict, reason: str, detail: str = "", *, level: int = logging.INFO) -> None:
+        """One line per (process, reason) so a 5s watcher retry cannot flood the log.
+
+        Names the stage where a completion notification stopped instead of leaving the event
+        silently in-flight: see the ``reason`` values (WATCHER_STARTED, SESSION_NOT_FOUND,
+        RESULT_ALREADY_CONSUMED, SURFACE_SUPPRESSED, RESULT_EMPTY, ROUTE_UNRESOLVED,
+        ADAPTER_UNAVAILABLE, OWNER_RETRY, BATCH_RETRY). Routing keys only — never output text.
+        """
+        key = (str(evt.get("session_id") or ""), reason)
+        seen = getattr(self, "_completion_diag_seen", None)
+        if seen is None:
+            seen = self._completion_diag_seen = set()
+        if key in seen:
+            return
+        seen.add(key)
+        logger.log(level, "completion diag: reason=%s process=%s session_key=%s platform=%s %s",
+                   reason, key[0] or "?", str(evt.get("session_key") or "")[:96],
+                   str(evt.get("platform") or ""), detail)
+
     @dataclasses.dataclass
     class _UpdatePaths:
         """Marker files ``hermes update --gateway`` and its watcher exchange under HERMES_HOME."""
@@ -1167,6 +1186,9 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             # session that profile's store owns (proven in ``_self_post_api_server``), fail-closed.
             adapter = self.adapters.get(Platform.API_SERVER)
         if not adapter:
+            self._completion_diag(evt, "ADAPTER_UNAVAILABLE",
+                                  f"platform={platform_name} profile={getattr(source, 'profile', None)!r} "
+                                  "— no push transport resolved for this profile")
             return False
         if not adapter_supports_push(adapter):
             # Non-push adapter (api_server): its chat_id IS the raw session id, so handle_message would
@@ -1419,6 +1441,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         elif verdict == "retry":
             # Transient uncertainty before admission: re-poll without spending a delivery attempt.
             claim.proceed, claim.early_result, claim.defer = False, False, True
+            self._completion_diag(evt, "OWNER_RETRY", "ownership unresolved (session db / rotation)")
         return claim
 
     def _completion_event_scope(self, evt: dict):
@@ -1955,12 +1978,17 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         ``pending_watchers`` for the startup / post-turn drain."""
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or not loop.is_running():
+            self._completion_diag(watcher, "WATCHER_NOT_ARMED",
+                                  f"running={getattr(self, '_running', False)} "
+                                  f"loop={'none' if loop is None else 'stopped'} — deferred to the drain")
             return False
         from agent.async_utils import safe_schedule_threadsafe
         future = safe_schedule_threadsafe(
             self._run_process_watcher(watcher), loop, logger=logger,
             log_message="Live process watcher arming failed",
         )
+        if future is None:
+            self._completion_diag(watcher, "WATCHER_NOT_ARMED", "live scheduling failed")
         return future is not None
 
     async def _run_process_watcher(self, watcher: dict) -> None:
@@ -1982,12 +2010,15 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             notify_mode = self._load_background_notifications_mode()
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
+        self._completion_diag(watcher, "WATCHER_STARTED", f"interval={interval}s agent_notify={agent_notify}")
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
         while True:
             await asyncio.sleep(interval)
             session = process_registry.get(session_id)
             if session is None:
+                self._completion_diag(watcher, "SESSION_NOT_FOUND",
+                                      "registry handle gone before the completion was delivered")
                 break
             async with self._completion_event_scope(watcher):
                 surface = should_surface_notification({
@@ -1996,11 +2027,14 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 })
             if not surface:
                 # Recheck live ownership next tick: handoff retains notification intent.
+                self._completion_diag(watcher, "SURFACE_SUPPRESSED",
+                                      f"exited={session.exited} task_id={getattr(session, 'task_id', '')!r}")
                 if session.exited:
                     break
                 continue
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
+                self._completion_diag(watcher, "NOTIFY_MODE_SILENT", f"notify_mode={notify_mode}")
                 if session.exited:
                     break
                 continue
@@ -2014,6 +2048,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
+                        self._completion_diag(watcher, "RESULT_EMPTY",
+                                              "format_process_notification returned no text")
                         break
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).
@@ -2022,6 +2058,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                     if delivered is False:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
+                        self._completion_diag(watcher, "BATCH_RETRY",
+                                              f"turn_busy={turn_busy} exit={session.exit_code}")
                         continue
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the injection only queues a follow-up, and
@@ -2036,6 +2074,8 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
                 if process_registry.is_completion_consumed(session_id):
+                    self._completion_diag(watcher, "RESULT_ALREADY_CONSUMED",
+                                          "completion was consumed via wait/log (#65379)")
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
