@@ -1,4 +1,4 @@
-"""Boot recovery binds a queued chat to the adapter its persisted transport names.
+"""Boot recovery binds a queued chat to the adapter its persisted transport names, and admission persists it.
 
 A satellite profile routed through the shared bot that also connects a bot-less platform (a2a) is a
 credential boundary, so a source with no live provenance resolves to no adapter for it. Boot recovery
@@ -108,3 +108,24 @@ async def test_recovery_binds_the_persisted_receiving_bot_for_a_profile_with_its
     [(sid, source, adapter)] = bound
     assert sid == "sid-1" and adapter is rig.primary
     assert runner._session_key_for_source(source) == entry.session_key
+
+
+def test_admitted_source_is_pinned_so_its_entry_persists_the_receiving_bot(rig):
+    """The source an admission rebuilds from its payload is the one the route's session entry is created
+    from. Left unpinned it persists no ``transport_profile``, which is exactly what boot recovery needs."""
+    import weakref
+
+    from gateway.session_envelope import restore_native_source
+    from gateway.session_identity import transport_profile_of
+
+    origin = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT, chat_type="dm", user_id=CHAT, profile="ops")
+    payload = {"native_text_v1": {"source": {**origin.to_dict(), "is_bot": False}, "provenance": {}}}
+
+    def restore_provenance(runner, source, provenance):  # what the real one installs: the connector's adapter
+        source._transport_adapter_ref = weakref.ref(rig.primary)
+
+    with patch("gateway.session_ingress_context.restore_provenance", restore_provenance), \
+            patch("gateway.session_ingress_context.callback_runner", lambda: rig.runner):
+        source = restore_native_source(payload)
+
+    assert transport_profile_of(source) == "default"
